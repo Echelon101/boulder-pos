@@ -50,18 +50,20 @@
     phone?: string | null;
     status: string;
     notes?: string | null;
+    balance_cents?: number;
   };
 
-  type Membership = {
+  type LoadMembersOptions = {
+    refreshMemberships?: boolean;
+  };
+
+  type MembershipType = {
     id: number;
-    member_id: number;
-    member_name: string;
-    membership_type: string;
-    status: string;
-    start_date?: string | null;
-    end_date?: string | null;
+    name: string;
+    description?: string | null;
     price_cents?: number | null;
-    notes?: string | null;
+    duration_days?: number | null;
+    max_uses?: number | null;
   };
 
   type Transaction = {
@@ -82,6 +84,13 @@
   };
 
   type RoleName = "admin" | "manager" | "user";
+
+  type NavItem = {
+    id: "verwaltung" | "mitglieder" | "transaktionen" | "checkins";
+    label: string;
+    minRole: RoleName;
+    mode: "view" | "modal";
+  };
 
   type SessionUser = {
     id: number;
@@ -114,10 +123,29 @@
     active: boolean;
   };
 
-  const navItems = [
-    { id: "verwaltung", label: "Kasse", minRole: "user" as RoleName },
-    { id: "mitglieder", label: "Mitglieder", minRole: "user" as RoleName },
-    { id: "transaktionen", label: "Transaktionen", minRole: "user" as RoleName }
+  type CheckinRecord = {
+    id: number;
+    member_id: number;
+    member_name: string;
+    membership_name?: string | null;
+    created_at: string;
+  };
+
+  type MemberMembership = {
+    id: number;
+    member_id: number;
+    membership_id: number;
+    membership_name: string;
+    remaining_uses?: number | null;
+    start_date?: string | null;
+    end_date?: string | null;
+  };
+
+  const navItems: NavItem[] = [
+    { id: "verwaltung", label: "Kasse", minRole: "user", mode: "view" },
+    { id: "mitglieder", label: "Mitglieder", minRole: "user", mode: "view" },
+    { id: "transaktionen", label: "Transaktionen", minRole: "user", mode: "view" },
+    { id: "checkins", label: "Check-ins", minRole: "manager", mode: "modal" }
   ];
 
   const adminTabs = [
@@ -154,7 +182,7 @@
   let products: Product[] = fallbackProducts;
   let productTypes: ProductType[] = [];
   let members: Member[] = [];
-  let memberships: Membership[] = [];
+  let memberships: MembershipType[] = [];
   let transactions: Transaction[] = [];
   let transactionsToday: Transaction[] = [];
 
@@ -170,10 +198,24 @@
   let bucketItems: BucketItem[] = [];
   let bucketsLoading = true;
   let bucketItemsLoading = false;
+  let paymentMemberTerm = "";
+  let paymentMemberResults: Member[] = [];
+  let paymentMemberId: number | null = null;
+  let selectedPaymentMember: Member | null = null;
+  let paymentUseBalance = false;
+  let checkoutMessage = "";
+  let checkoutInProgress = false;
 
   let showAdminModal = false;
   let activeAdminTab = 0;
   let navMessage = "";
+  let memberSearchTerm = "";
+  let memberSearchResults: Member[] = [];
+  let checkinMessage = "";
+  let checkinMessageType: "success" | "error" | null = null;
+  let showCheckinModal = false;
+  let checkinsToday: CheckinRecord[] = [];
+  let checkedInMemberIds = new Set<number>();
 
   const blankProductForm = () => ({
     id: null as number | null,
@@ -200,19 +242,18 @@
     email: "",
     phone: "",
     status: "active",
-    notes: ""
+    notes: "",
+    balance_cents: 0
   });
   let memberForm = blankMemberForm();
 
   const blankMembershipForm = () => ({
     id: null as number | null,
-    member_id: members[0]?.id ?? 0,
-    membership_type: "",
-    status: "active",
-    start_date: "",
-    end_date: "",
+    name: "",
+    description: "",
     price_cents: 0,
-    notes: ""
+    duration_days: null as number | null,
+    max_uses: null as number | null
   });
   let membershipForm = blankMembershipForm();
   const blankSettingsForm = (): AppSettings => ({
@@ -226,6 +267,8 @@
   let settingsLoading = false;
   let settingsMessage = "";
   let users: UserAccount[] = [];
+  let memberMemberships: MemberMembership[] = [];
+  let newMemberMembershipId: number | null = null;
   let roles: RoleOption[] = [];
   const blankUserForm = (): UserFormState => ({
     id: null,
@@ -294,7 +337,10 @@
       email: "demo@example.com",
       phone: "+49 000 000",
       status: "active",
-      notes: "Testzugang"
+      notes: "Testzugang",
+      active_membership_id: 1,
+      active_membership_type: "Demo Mitgliedschaft",
+      balance_cents: 1500
     }
   ];
 
@@ -306,6 +352,36 @@
       total_cents: 860,
       description: "Demo Bestellung",
       created_at: "2024-01-01T11:00:00Z"
+    }
+  ];
+  const mockMemberships: MembershipType[] = [
+    {
+      id: 6001,
+      name: "Demo Mitgliedschaft",
+      description: "Unbegrenzter Zugang",
+      price_cents: 1500,
+      duration_days: 30,
+      max_uses: null
+    }
+  ];
+  const mockCheckins: CheckinRecord[] = [
+    {
+      id: 1,
+      member_id: 8001,
+      member_name: "Demo Mitglied",
+      membership_name: "Demo Mitgliedschaft",
+      created_at: "2024-01-01T11:15:00Z"
+    }
+  ];
+  const mockMemberMemberships: MemberMembership[] = [
+    {
+      id: 5001,
+      member_id: 8001,
+      membership_id: 6001,
+      membership_name: "Demo Mitgliedschaft",
+      remaining_uses: 3,
+      start_date: "2024-01-01",
+      end_date: "2024-01-31"
     }
   ];
 
@@ -327,7 +403,68 @@
   $: displayBucketsLoading = currentUser ? bucketsLoading : false;
   $: displayBucketItems = currentUser ? bucketItems : mockBucketItems;
   $: displayMembers = currentUser ? members : mockMembers;
+  $: displayMemberships = currentUser ? memberships : mockMemberships;
   $: displayTransactionsToday = currentUser ? transactionsToday : mockTransactionsToday;
+  $: sourceMemberMemberships = currentUser ? memberMemberships : mockMemberMemberships;
+  $: memberMembershipMap = sourceMemberMemberships.reduce((map, mm) => {
+      const list = map.get(mm.member_id) ?? [];
+      list.push(mm);
+      map.set(mm.member_id, list);
+      return map;
+    }, new Map<number, MemberMembership[]>());
+  const formatMembershipInstance = (mm: MemberMembership) => {
+    if (!mm) return "";
+    const parts = [] as string[];
+    if (mm.remaining_uses != null) {
+      parts.push(`${mm.remaining_uses}x`);
+    }
+    if (mm.end_date) {
+      parts.push(`bis ${mm.end_date}`);
+    }
+    const details = parts.length ? ` (${parts.join(", ")})` : "";
+    return `${mm.membership_name}${details}`;
+  };
+  $: memberMembershipSummary = (() => {
+    const map = new Map<number, string[]>();
+    memberMembershipMap.forEach((list, memberId) => {
+      map.set(memberId, list.map(formatMembershipInstance));
+    });
+    return map;
+  })();
+  const membershipSummaryText = (memberId: number) => {
+    const list = memberMembershipSummary.get(memberId) ?? [];
+    return list.length ? list.join(", ") : "Keine Mitgliedschaft";
+  };
+  $: selectedPaymentMember =
+    paymentMemberId != null
+      ? displayMembers.find((member) => member.id === paymentMemberId) ?? null
+      : null;
+  $: paymentMemberResults = (() => {
+    const trimmed = paymentMemberTerm.trim().toLowerCase();
+    if (!trimmed) {
+      return [];
+    }
+    if (
+      selectedPaymentMember &&
+      `${selectedPaymentMember.first_name} ${selectedPaymentMember.last_name}`
+        .trim()
+        .toLowerCase() === trimmed
+    ) {
+      return [];
+    }
+    return displayMembers
+      .filter((member) =>
+        `${member.first_name} ${member.last_name} ${member.email ?? ""}`
+          .toLowerCase()
+          .includes(trimmed)
+      )
+      .slice(0, 5);
+  })();
+  $: if (!selectedPaymentMember) {
+    paymentUseBalance = false;
+  }
+  $: displayCheckins = currentUser ? checkinsToday : mockCheckins;
+  $: checkedInMemberIds = new Set(displayCheckins.map((entry) => entry.member_id));
   $: displayBucketItemsLoading = currentUser ? bucketItemsLoading : false;
   $: displayActiveBucketId =
     currentUser ? activeBucketId : displayBuckets[0]?.id ?? null;
@@ -428,29 +565,31 @@
   }
 
   async function handleCreateBucket() {
-    const suggestion = `Bucket ${buckets.length + 1}`;
-    const name = window.prompt("Neuen Bucket anlegen", suggestion);
-    await createBucketWithName(name ?? undefined);
-  }
-
-  async function handleRenameBucket(bucketId: number) {
-    const bucket = buckets.find((b) => b.id === bucketId);
-    const name = window.prompt("Bucket umbenennen", bucket?.name ?? "");
-    if (!name || !name.trim() || name.trim() === bucket?.name) {
-      return;
-    }
-    try {
-      await invoke("rename_bucket", { payload: { id: bucketId, name: name.trim() } });
-      await loadBuckets(bucketId);
-      await loadBucketItems(bucketId);
-    } catch (error) {
-      console.error("Bucket konnte nicht umbenannt werden", error);
-    }
+    await createBucketWithName(null);
   }
 
   async function handleBucketSelect(bucketId: number) {
     activeBucketId = bucketId;
     await loadBucketItems(bucketId);
+  }
+
+  async function handleCloseBucket(bucketId: number) {
+    if (!currentUser) return;
+    if (!window.confirm("Bucket abschließen und entfernen?")) return;
+    try {
+      await invoke("delete_bucket", { payload: { bucketId } });
+      if (activeBucketId === bucketId) {
+        activeBucketId = null;
+      }
+      await loadBuckets();
+      if (activeBucketId) {
+        await loadBucketItems(activeBucketId);
+      } else {
+        bucketItems = [];
+      }
+    } catch (error) {
+      console.error("Bucket konnte nicht gelöscht werden", error);
+    }
   }
 
   function formatPrice(cents: number) {
@@ -494,6 +633,75 @@
     }
   }
 
+  function handlePaymentMemberInput(event: Event) {
+    const value = (event.currentTarget as HTMLInputElement)?.value ?? "";
+    if (
+      paymentMemberId &&
+      selectedPaymentMember &&
+      value.trim().toLowerCase() !==
+        `${selectedPaymentMember.first_name} ${selectedPaymentMember.last_name}`
+          .trim()
+          .toLowerCase()
+    ) {
+      paymentMemberId = null;
+    }
+    paymentMemberTerm = value;
+  }
+
+  function selectPaymentMember(member: Member) {
+    paymentMemberId = member.id;
+    paymentMemberTerm = `${member.first_name} ${member.last_name}`.trim();
+  }
+
+  function clearPaymentMember() {
+    paymentMemberId = null;
+    paymentMemberTerm = "";
+  }
+
+  async function startCheckout() {
+    if (
+      !currentUser ||
+      !activeBucketId ||
+      bucketItems.length === 0 ||
+      bucketItemsLoading ||
+      checkoutInProgress
+    ) {
+      return;
+    }
+    if (paymentUseBalance && !selectedPaymentMember) {
+      checkoutMessage = "Mitglied für Guthaben-Zahlung auswählen.";
+      return;
+    }
+    checkoutInProgress = true;
+    checkoutMessage = "";
+    try {
+      await invoke("checkout_bucket", {
+        payload: {
+          bucketId: activeBucketId,
+          memberId: selectedPaymentMember?.id ?? null,
+          useBalance: paymentUseBalance,
+          paymentMethod: paymentUseBalance ? "Guthaben" : "Bar"
+        }
+      });
+      checkoutMessage = "Zahlung abgeschlossen.";
+      paymentMemberId = null;
+      paymentMemberTerm = "";
+      paymentUseBalance = false;
+      await loadBuckets();
+      if (activeBucketId) {
+        await loadBucketItems(activeBucketId);
+      } else {
+        bucketItems = [];
+      }
+      await Promise.all([loadMembers({ refreshMemberships: true }), loadTransactionsToday()]);
+    } catch (error) {
+      console.error("Checkout fehlgeschlagen", error);
+      checkoutMessage = "Zahlung fehlgeschlagen.";
+    } finally {
+      checkoutInProgress = false;
+    }
+  }
+
   function openAdminModal() {
     if (!currentUser || currentUser.role === "user") {
       navMessage = "Keine Berechtigung für Kasse.";
@@ -519,10 +727,10 @@
         await loadProductTypes();
         break;
       case "Mitglieder":
-        await loadMembers();
+        await loadMembers({ refreshMemberships: true });
         break;
       case "Mitgliedschaften":
-        await Promise.all([loadMembers(), loadMemberships()]);
+        await Promise.all([loadMembers({ refreshMemberships: true }), loadMemberships()]);
         break;
       case "Transaktionen":
         await loadTransactions();
@@ -625,12 +833,22 @@
     }
   }
 
-  async function loadMembers() {
+  async function loadMembers(options?: LoadMembersOptions) {
     try {
       const data = await invoke<Member[]>("list_members");
-      members = data ?? [];
-      if (!membershipForm.member_id && members.length > 0) {
-        membershipForm.member_id = members[0].id;
+      members =
+        data?.map((member: any) => ({
+          id: member.id,
+          first_name: member.first_name ?? member.firstName ?? "",
+          last_name: member.last_name ?? member.lastName ?? "",
+          email: member.email ?? null,
+          phone: member.phone ?? null,
+          status: member.status ?? "active",
+          notes: member.notes ?? "",
+          balance_cents: member.balance_cents ?? member.balanceCents ?? 0
+        })) ?? [];
+      if (options?.refreshMemberships) {
+        await loadMemberMemberships();
       }
     } catch (error) {
       console.error("Mitglieder konnten nicht geladen werden", error);
@@ -640,9 +858,20 @@
   async function submitMember() {
     if (!memberForm.first_name.trim() || !memberForm.last_name.trim()) return;
     try {
-      await invoke("save_member", { payload: memberForm });
+      const payload = {
+        id: memberForm.id,
+        firstName: memberForm.first_name,
+        lastName: memberForm.last_name,
+        email: memberForm.email,
+        phone: memberForm.phone,
+        status: memberForm.status,
+        notes: memberForm.notes,
+        activeMembershipId: memberForm.active_membership_id,
+        balanceCents: memberForm.balance_cents
+      };
+      await invoke("save_member", { payload });
       memberForm = blankMemberForm();
-      await loadMembers();
+      await loadMembers({ refreshMemberships: true });
     } catch (error) {
       console.error("Mitglied konnte nicht gespeichert werden", error);
     }
@@ -656,7 +885,8 @@
       email: member.email ?? "",
       phone: member.phone ?? "",
       status: member.status,
-      notes: member.notes ?? ""
+      notes: member.notes ?? "",
+      balance_cents: member.balance_cents ?? 0
     };
   }
 
@@ -667,7 +897,7 @@
       if (memberForm.id === id) {
         memberForm = blankMemberForm();
       }
-      await Promise.all([loadMembers(), loadMemberships()]);
+      await Promise.all([loadMembers({ refreshMemberships: true }), loadMemberships()]);
     } catch (error) {
       console.error("Mitglied konnte nicht gelöscht werden", error);
     }
@@ -675,17 +905,52 @@
 
   async function loadMemberships() {
     try {
-      const data = await invoke<Membership[]>("list_memberships");
-      memberships = data ?? [];
+      const data = await invoke<MembershipType[]>("list_memberships");
+      memberships =
+        data?.map((ms: any) => ({
+          id: ms.id,
+          name: ms.name ?? ms.membership_type ?? "",
+          description: ms.description ?? ms.notes ?? "",
+          price_cents: ms.price_cents ?? ms.priceCents ?? 0,
+          duration_days: ms.duration_days ?? ms.durationDays ?? null,
+          max_uses: ms.max_uses ?? ms.maxUses ?? null
+        })) ?? [];
     } catch (error) {
       console.error("Mitgliedschaften konnten nicht geladen werden", error);
     }
   }
 
-  async function submitMembership() {
-    if (!membershipForm.member_id || !membershipForm.membership_type.trim()) return;
+  async function loadMemberMemberships() {
     try {
-      await invoke("save_membership", { payload: membershipForm });
+      const data = await invoke<MemberMembershipRecord[]>("list_member_memberships");
+      memberMemberships =
+        data?.map((mm: any) => ({
+          id: mm.id,
+          member_id: mm.member_id ?? mm.memberId,
+          membership_id: mm.membership_id ?? mm.membershipId,
+          membership_name: mm.membership_name ?? mm.membershipName ?? "",
+          remaining_uses: mm.remaining_uses ?? mm.remainingUses ?? null,
+          start_date: mm.start_date ?? mm.startDate ?? null,
+          end_date: mm.end_date ?? mm.endDate ?? null,
+          created_at: mm.created_at ?? mm.createdAt ?? ""
+        })) ?? [];
+    } catch (error) {
+      console.error("Mitgliedschaftszuweisungen konnten nicht geladen werden", error);
+    }
+  }
+
+  async function submitMembership() {
+    if (!membershipForm.name.trim()) return;
+    try {
+      const payload = {
+        id: membershipForm.id,
+        name: membershipForm.name,
+        description: membershipForm.description || null,
+        priceCents: membershipForm.price_cents ?? 0,
+        durationDays: membershipForm.duration_days,
+        maxUses: membershipForm.max_uses
+      };
+      await invoke("save_membership", { payload });
       membershipForm = blankMembershipForm();
       await loadMemberships();
     } catch (error) {
@@ -693,16 +958,14 @@
     }
   }
 
-  function editMembership(ms: Membership) {
+  function editMembership(ms: MembershipType) {
     membershipForm = {
       id: ms.id,
-      member_id: ms.member_id,
-      membership_type: ms.membership_type,
-      status: ms.status,
-      start_date: ms.start_date ?? "",
-      end_date: ms.end_date ?? "",
+      name: ms.name,
+      description: ms.description ?? "",
       price_cents: ms.price_cents ?? 0,
-      notes: ms.notes ?? ""
+      duration_days: ms.duration_days ?? null,
+      max_uses: ms.max_uses ?? null
     };
   }
 
@@ -714,8 +977,34 @@
         membershipForm = blankMembershipForm();
       }
       await loadMemberships();
+      await loadMemberMemberships();
     } catch (error) {
       console.error("Mitgliedschaft konnte nicht gelöscht werden", error);
+    }
+  }
+
+  async function assignMembershipToMember() {
+    if (!memberForm.id || !newMemberMembershipId) {
+      return;
+    }
+    try {
+      await invoke("assign_member_membership", {
+        payload: { memberId: memberForm.id, membershipId: newMemberMembershipId }
+      });
+      newMemberMembershipId = null;
+      await loadMembers({ refreshMemberships: true });
+    } catch (error) {
+      console.error("Mitgliedschaft konnte nicht zugewiesen werden", error);
+    }
+  }
+
+  async function removeMemberMembership(id: number) {
+    if (!window.confirm("Zuweisung entfernen?")) return;
+    try {
+      await invoke("delete_member_membership", { id });
+      await loadMembers({ refreshMemberships: true });
+    } catch (error) {
+      console.error("Zuweisung konnte nicht gelöscht werden", error);
     }
   }
 
@@ -734,6 +1023,22 @@
       transactionsToday = data ?? [];
     } catch (error) {
       console.error("Heutige Transaktionen konnten nicht geladen werden", error);
+    }
+  }
+
+  async function loadCheckinsToday() {
+    try {
+      const data = await invoke<CheckinRecord[]>("list_checkins_today");
+      checkinsToday =
+        data?.map((entry: any) => ({
+          id: entry.id,
+          member_id: entry.member_id ?? entry.memberId,
+          member_name: entry.member_name ?? entry.memberName ?? "",
+          membership_name: entry.membership_name ?? entry.membershipName ?? null,
+          created_at: entry.created_at ?? entry.createdAt ?? ""
+        })) ?? [];
+    } catch (error) {
+      console.error("Check-ins konnten nicht geladen werden", error);
     }
   }
 
@@ -854,7 +1159,7 @@
     return rolePriority[actual] >= rolePriority[required];
   }
 
-  function canAccessNav(itemId: "verwaltung" | "mitglieder" | "transaktionen") {
+  function canAccessNav(itemId: NavItem["id"]) {
     if (!currentUser) return false;
     const def = navItems.find((n) => n.id === itemId);
     if (!def) return false;
@@ -869,10 +1174,23 @@
     }
     activeNav = itemId;
     if (itemId === "mitglieder") {
-      await loadMembers();
+      await Promise.all([loadMembers({ refreshMemberships: true }), loadMemberships()]);
     } else if (itemId === "transaktionen") {
       await loadTransactionsToday();
     }
+  }
+
+  async function handleNavClick(item: NavItem) {
+    navMessage = "";
+    if (!canAccessNav(item.id)) {
+      navMessage = "Keine Berechtigung für diesen Bereich.";
+      return;
+    }
+    if (item.mode === "modal") {
+      await openCheckinModal();
+      return;
+    }
+    await handleNavChange(item.id as "verwaltung" | "mitglieder" | "transaktionen");
   }
 
   async function handleLogin(event?: Event) {
@@ -884,9 +1202,21 @@
       });
       currentUser = user;
       loginForm = { username: "", password: "" };
+      checkoutMessage = "";
+      paymentMemberTerm = "";
+      paymentMemberId = null;
+      paymentUseBalance = false;
       if (!canAccessNav(activeNav)) {
         activeNav = currentUser?.role === "user" ? "mitglieder" : "verwaltung";
       }
+      await initializeBuckets();
+      await loadMemberMemberships();
+      await Promise.all([
+        loadMembers(),
+        loadMemberships(),
+        loadTransactionsToday(),
+        loadCheckinsToday()
+      ]);
     } catch (error) {
       console.error("Login fehlgeschlagen", error);
       loginError = "Anmeldung nicht möglich.";
@@ -897,11 +1227,80 @@
     currentUser = null;
     showAdminModal = false;
     activeNav = "verwaltung";
+    memberMemberships = [];
+    checkinsToday = [];
+    memberSearchTerm = "";
+    checkinMessage = "";
+    checkinMessageType = null;
+    paymentMemberTerm = "";
+    paymentMemberId = null;
+    paymentUseBalance = false;
+    checkoutMessage = "";
+    checkoutInProgress = false;
   }
 
   $: if (currentUser && !canAccessNav(activeNav)) {
     activeNav = currentUser.role === "user" ? "mitglieder" : "verwaltung";
   }
+
+  async function openCheckinModal() {
+    if (!currentUser) return;
+    await loadCheckinsToday();
+    showCheckinModal = true;
+  }
+
+  function closeCheckinModal() {
+    showCheckinModal = false;
+  }
+
+  async function checkInMember(member: Member) {
+    if (!currentUser) return;
+    if (checkedInMemberIds.has(member.id)) {
+      checkinMessage = `${member.first_name} ${member.last_name} ist bereits eingecheckt.`;
+      checkinMessageType = "error";
+      return;
+    }
+    try {
+      checkinMessage = "";
+      checkinMessageType = null;
+      await invoke("record_checkin", { payload: { memberId: member.id } });
+      checkinMessage = `${member.first_name} ${member.last_name} eingecheckt.`;
+      checkinMessageType = "success";
+      memberSearchTerm = "";
+      await Promise.all([loadCheckinsToday(), loadMemberMemberships()]);
+    } catch (error) {
+      console.error("Check-in fehlgeschlagen", error);
+      const message =
+        typeof error === "string"
+          ? error
+          : (error as { message?: string })?.message ?? "Check-in fehlgeschlagen.";
+      checkinMessage = message;
+      checkinMessageType = "error";
+    }
+  }
+
+  async function deleteCheckinRecord(id: number) {
+    if (!currentUser) return;
+    if (!window.confirm("Check-in löschen?")) return;
+    try {
+      await invoke("delete_checkin", { id });
+      await Promise.all([loadCheckinsToday(), loadMemberMemberships()]);
+    } catch (error) {
+      console.error("Check-in konnte nicht gelöscht werden", error);
+    }
+  }
+
+  $: memberSearchResults = memberSearchTerm.trim()
+    ? displayMembers
+        .filter((member) =>
+          `${member.first_name} ${member.last_name} ${member.email ?? ""} ${
+            membershipSummaryText(member.id)
+          }`
+            .toLowerCase()
+            .includes(memberSearchTerm.trim().toLowerCase())
+        )
+        .slice(0, 5)
+    : displayMembers.slice(0, 5);
 </script>
 
 {#if !currentUser}
@@ -930,9 +1329,9 @@
     <nav class="tab-strip">
       {#each navItems as item}
         <button
-          class:active={activeNav === item.id}
+          class:active={item.mode === "view" && activeNav === item.id}
           disabled={!currentUser || !canAccessNav(item.id)}
-          on:click={() => handleNavChange(item.id)}
+          on:click={() => handleNavClick(item)}
         >
           {item.label}
         </button>
@@ -972,8 +1371,9 @@
           <p class="muted">Noch keine Buckets vorhanden.</p>
         {:else}
           {#each displayBuckets as bucket}
-            <button
-              type="button"
+            <div
+              role="button"
+              tabindex="0"
               class="bucket-row"
               class:active={bucket.id === displayActiveBucketId}
               on:click={() => currentUser && handleBucketSelect(bucket.id)}
@@ -984,14 +1384,19 @@
                   {bucket.item_count} · {formatPrice(bucket.total_cents)}
                 </span>
               </div>
-              <span
-                class="rename-bucket"
-                title="Umbenennen"
-                on:click|stopPropagation={() => handleRenameBucket(bucket.id)}
-              >
-                ✎
-              </span>
-            </button>
+              {#if currentUser}
+                <div class="bucket-row-actions">
+                  <button
+                    type="button"
+                    class="bucket-icon danger"
+                    title="Abschließen & entfernen"
+                    on:click|stopPropagation={() => handleCloseBucket(bucket.id)}
+                  >
+                    🗑
+                  </button>
+                </div>
+              {/if}
+            </div>
           {/each}
         {/if}
       </div>
@@ -1054,19 +1459,107 @@
         </div>
         <div class="total">{formatPrice(bucketTotal)}</div>
       </div>
+      <div class="payment-section">
+        <label>
+          Mitglied (optional)
+          <input
+            type="text"
+            placeholder="Name oder E-Mail"
+            value={paymentMemberTerm}
+            on:input={handlePaymentMemberInput}
+            disabled={!currentUser}
+          />
+        </label>
+        {#if currentUser && paymentMemberResults.length > 0}
+          <div class="payment-results">
+            {#each paymentMemberResults as member}
+              <button type="button" on:click={() => selectPaymentMember(member)}>
+                <span>{member.first_name} {member.last_name}</span>
+                <small>Guthaben: {formatPrice(member.balance_cents ?? 0)}</small>
+              </button>
+            {/each}
+          </div>
+        {/if}
+        {#if selectedPaymentMember}
+          <div class="selected-member">
+            <div>
+              <strong>{selectedPaymentMember.first_name} {selectedPaymentMember.last_name}</strong>
+              <small>Guthaben: {formatPrice(selectedPaymentMember.balance_cents ?? 0)}</small>
+            </div>
+            <button type="button" class="linkish" on:click={clearPaymentMember}>Entfernen</button>
+          </div>
+          <label class="balance-option">
+            <input
+              type="checkbox"
+              bind:checked={paymentUseBalance}
+              disabled={!currentUser}
+            />
+            Mit Guthaben bezahlen ({formatPrice(bucketTotal)})
+          </label>
+        {/if}
+        {#if checkoutMessage}
+          <p class="status-note">{checkoutMessage}</p>
+        {/if}
+      </div>
       <button
         class="checkout"
         type="button"
+        on:click={startCheckout}
         disabled={
           !currentUser ||
           !activeBucketId ||
           bucketItems.length === 0 ||
-          bucketItemsLoading
+          bucketItemsLoading ||
+          checkoutInProgress
         }
       >
-        Zahlung starten
+        {checkoutInProgress ? "Verarbeite..." : "Zahlung starten"}
       </button>
     </aside>
+    </section>
+    <section class="checkin-panel">
+      <h3>Mitglied Check-in</h3>
+      <p>Mitglieder schnell suchen und den Besuch erfassen.</p>
+      <input
+        type="text"
+        placeholder="Name oder E-Mail suchen"
+        bind:value={memberSearchTerm}
+        disabled={!currentUser}
+      />
+      {#if checkinMessage}
+        <p class="status-note" class:error={checkinMessageType === "error"}>
+          {checkinMessage}
+        </p>
+      {/if}
+      <div class="checkin-results">
+        {#if !currentUser}
+          <p>Bitte anmelden, um Check-ins zu erfassen.</p>
+        {:else if memberSearchResults.length === 0}
+          <p>Keine Mitglieder gefunden.</p>
+        {:else}
+          {#each memberSearchResults as member}
+            <div class="checkin-result">
+              <div>
+                <strong>{member.first_name} {member.last_name}</strong>
+                <small>{membershipSummaryText(member.id)}</small>
+                <small>Guthaben: {formatPrice(member.balance_cents ?? 0)}</small>
+              </div>
+              <div class="checkin-actions">
+                {#if checkedInMemberIds.has(member.id)}
+                  <small class="checked-in-flag">Bereits eingecheckt</small>
+                {/if}
+                <button
+                  type="button"
+                  on:click={() => checkInMember(member)}
+                  disabled={!currentUser || checkedInMemberIds.has(member.id)}
+                >
+                  Einchecken
+                </button>
+              </div>
+            </div>
+          {/each}
+        {/if}
+      </div>
     </section>
   {:else if activeNav === "mitglieder"}
     <section class="nav-panel">
@@ -1098,6 +1591,18 @@
             </select>
           </label>
           <label>
+            Guthaben (€)
+            <input
+              type="number"
+              step="0.01"
+              value={(memberForm.balance_cents ?? 0) / 100}
+              on:input={(event) =>
+                (memberForm.balance_cents = euroInputToCents(
+                  (event.currentTarget as HTMLInputElement).value
+                ))}
+            />
+          </label>
+          <label>
             Notizen
             <textarea rows="2" bind:value={memberForm.notes}></textarea>
           </label>
@@ -1114,6 +1619,8 @@
                 <th>Name</th>
                 <th>E-Mail</th>
                 <th>Status</th>
+                <th>Mitgliedschaften</th>
+                <th>Guthaben</th>
                 <th></th>
               </tr>
             </thead>
@@ -1123,6 +1630,8 @@
                   <td>{member.first_name} {member.last_name}</td>
                   <td>{member.email ?? "—"}</td>
                   <td>{member.status}</td>
+                  <td>{membershipSummaryText(member.id)}</td>
+                  <td>{formatPrice(member.balance_cents ?? 0)}</td>
                   <td class="actions">
                     <button type="button" on:click={() => editMember(member)}>Bearbeiten</button>
                     <button type="button" on:click={() => removeMember(member.id)}>Löschen</button>
@@ -1132,6 +1641,59 @@
             </tbody>
           </table>
         </div>
+        {#if memberForm.id}
+          <div class="member-memberships">
+            <h4>Zugewiesene Mitgliedschaften</h4>
+            <div class="assign-row">
+              <select bind:value={newMemberMembershipId}>
+                <option value="">Typ wählen</option>
+                {#each displayMemberships as membership}
+                  <option value={membership.id}>{membership.name}</option>
+                {/each}
+              </select>
+              <button
+                type="button"
+                on:click={assignMembershipToMember}
+                disabled={!newMemberMembershipId}
+              >
+                Zuweisen
+              </button>
+            </div>
+            <div class="admin-table compact">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Mitgliedschaft</th>
+                    <th>Start</th>
+                    <th>Ende</th>
+                    <th>Verbleibend</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each memberMembershipMap.get(memberForm.id) ?? [] as assignment}
+                    <tr>
+                      <td>{formatMembershipInstance(assignment)}</td>
+                      <td>{assignment.start_date ?? "—"}</td>
+                      <td>{assignment.end_date ?? "—"}</td>
+                      <td>
+                        {assignment.remaining_uses ?? "∞"}
+                      </td>
+                      <td class="actions">
+                        <button type="button" on:click={() => removeMemberMembership(assignment.id)}>Entfernen</button>
+                      </td>
+                    </tr>
+                  {/each}
+                  {#if (memberMembershipMap.get(memberForm.id) ?? []).length === 0}
+                    <tr>
+                      <td colspan="5">Keine aktiven Mitgliedschaften.</td>
+                    </tr>
+                  {/if}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        {/if}
       </div>
     </section>
   {:else}
@@ -1343,6 +1905,18 @@
                 </select>
               </label>
               <label>
+                Guthaben (€)
+                <input
+                  type="number"
+                  step="0.01"
+                  value={(memberForm.balance_cents ?? 0) / 100}
+                  on:input={(event) =>
+                    (memberForm.balance_cents = euroInputToCents(
+                      (event.currentTarget as HTMLInputElement).value
+                    ))}
+                />
+              </label>
+              <label>
                 Notizen
                 <textarea rows="2" bind:value={memberForm.notes}></textarea>
               </label>
@@ -1359,6 +1933,8 @@
                     <th>Name</th>
                     <th>E-Mail</th>
                     <th>Status</th>
+                    <th>Mitgliedschaft</th>
+                    <th>Guthaben</th>
                     <th></th>
                   </tr>
                 </thead>
@@ -1368,6 +1944,8 @@
                       <td>{member.first_name} {member.last_name}</td>
                       <td>{member.email ?? "—"}</td>
                       <td>{member.status}</td>
+                      <td>{member.active_membership_type ?? "—"}</td>
+                      <td>{formatPrice(member.balance_cents ?? 0)}</td>
                       <td class="actions">
                         <button type="button" on:click={() => editMember(member)}>Bearbeiten</button>
                         <button type="button" on:click={() => removeMember(member.id)}>Löschen</button>
@@ -1383,42 +1961,12 @@
             <form class="admin-form" on:submit|preventDefault={submitMembership}>
               <h3>{membershipForm.id ? "Mitgliedschaft bearbeiten" : "Mitgliedschaft anlegen"}</h3>
               <label>
-                Mitglied
-                <select
-                  value={membershipForm.member_id || ""}
-                  on:change={(event) => {
-                    const value = (event.currentTarget as HTMLSelectElement).value;
-                    membershipForm.member_id = value ? Number(value) : 0;
-                  }}
-                >
-                  {#if members.length === 0}
-                    <option value="" disabled>Keine Mitglieder vorhanden</option>
-                  {:else}
-                    {#each members as member}
-                      <option value={member.id}>{member.first_name} {member.last_name}</option>
-                    {/each}
-                  {/if}
-                </select>
+                Name
+                <input bind:value={membershipForm.name} required />
               </label>
               <label>
-                Typ
-                <input bind:value={membershipForm.membership_type} required />
-              </label>
-              <label>
-                Status
-                <select bind:value={membershipForm.status}>
-                  <option value="active">Aktiv</option>
-                  <option value="paused">Pausiert</option>
-                  <option value="cancelled">Beendet</option>
-                </select>
-              </label>
-              <label>
-                Startdatum
-                <input type="date" bind:value={membershipForm.start_date} />
-              </label>
-              <label>
-                Enddatum
-                <input type="date" bind:value={membershipForm.end_date} />
+                Beschreibung
+                <textarea rows="2" bind:value={membershipForm.description}></textarea>
               </label>
               <label>
                 Preis (€)
@@ -1434,8 +1982,28 @@
                 />
               </label>
               <label>
-                Notizen
-                <textarea rows="2" bind:value={membershipForm.notes}></textarea>
+                Dauer (Tage)
+                <input
+                  type="number"
+                  min="0"
+                  value={membershipForm.duration_days ?? ""}
+                  on:input={(event) => {
+                    const value = (event.currentTarget as HTMLInputElement).value;
+                    membershipForm.duration_days = value ? Number(value) : null;
+                  }}
+                />
+              </label>
+              <label>
+                Maximale Nutzungen
+                <input
+                  type="number"
+                  min="0"
+                  value={membershipForm.max_uses ?? ""}
+                  on:input={(event) => {
+                    const value = (event.currentTarget as HTMLInputElement).value;
+                    membershipForm.max_uses = value ? Number(value) : null;
+                  }}
+                />
               </label>
               <div class="form-actions">
                 <button type="submit">{membershipForm.id ? "Aktualisieren" : "Speichern"}</button>
@@ -1443,26 +2011,24 @@
               </div>
             </form>
             <div class="admin-table">
-              <h3>Mitgliedschaften</h3>
+              <h3>Mitgliedschaftstypen</h3>
               <table>
                 <thead>
                   <tr>
-                    <th>Mitglied</th>
-                    <th>Typ</th>
-                    <th>Status</th>
-                    <th>Laufzeit</th>
+                    <th>Name</th>
+                    <th>Preis</th>
+                    <th>Dauer (Tage)</th>
+                    <th>Nutzungen</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
                   {#each memberships as ms}
                     <tr>
-                      <td>{ms.member_name}</td>
-                      <td>{ms.membership_type}</td>
-                      <td>{ms.status}</td>
-                      <td>
-                        {ms.start_date ?? "—"} – {ms.end_date ?? "—"}
-                      </td>
+                      <td>{ms.name}</td>
+                      <td>{formatPrice(ms.price_cents ?? 0)}</td>
+                      <td>{ms.duration_days ?? "—"}</td>
+                      <td>{ms.max_uses ?? "unbegrenzt"}</td>
                       <td class="actions">
                         <button type="button" on:click={() => editMembership(ms)}>Bearbeiten</button>
                         <button type="button" on:click={() => removeMembership(ms.id)}>Löschen</button>
@@ -1649,6 +2215,56 @@
   </div>
 {/if}
 
+{#if showCheckinModal}
+  <div class="modal-overlay" on:click={closeCheckinModal}>
+    <div class="modal checkins-modal" on:click|stopPropagation>
+      <header class="modal-header">
+        <h2>Heutige Check-ins</h2>
+        <button class="close-btn" type="button" on:click={closeCheckinModal}>×</button>
+      </header>
+      <section class="modal-body">
+        <div class="admin-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Mitglied</th>
+                <th>Mitgliedschaft</th>
+                <th>Zeit</th>
+                <th>Aktion</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#if displayCheckins.length === 0}
+                <tr>
+                  <td colspan="4">Keine Check-ins heute.</td>
+                </tr>
+              {:else}
+                {#each displayCheckins as checkin}
+                  <tr>
+                    <td>{checkin.member_name}</td>
+                    <td>{checkin.membership_name ?? "Keine"}</td>
+                    <td>{new Date(checkin.created_at).toLocaleTimeString("de-DE")}</td>
+                    <td>
+                      <button
+                        type="button"
+                        class="checkin-delete-btn"
+                        on:click={() => deleteCheckinRecord(checkin.id)}
+                        disabled={!currentUser}
+                      >
+                        Entfernen
+                      </button>
+                    </td>
+                  </tr>
+                {/each}
+              {/if}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </div>
+{/if}
+
 <style>
 :global(body) {
   margin: 0;
@@ -1753,6 +2369,191 @@
   padding: 1rem;
 }
 
+.checkin-panel {
+  margin: 1rem;
+  background: #f5f5f5;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.checkin-panel input {
+  border-radius: 4px;
+  border: 1px solid #cfcfcf;
+  padding: 0.5rem;
+  font: inherit;
+}
+
+.status-note {
+  margin: 0;
+  color: #2e7d32;
+  font-size: 0.9rem;
+}
+
+.status-note.error {
+  color: #b71c1c;
+}
+
+.checkin-results {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.checkin-result {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.6rem;
+  background: #ffffff;
+  border-radius: 6px;
+  border: 1px solid #e0e0e0;
+}
+
+.checkin-result strong {
+  display: block;
+}
+
+.checkin-result small {
+  display: block;
+  color: #666;
+}
+
+.checkin-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.25rem;
+}
+
+.checkin-result button {
+  border: none;
+  border-radius: 4px;
+  padding: 0.4rem 0.8rem;
+  background: #4caf50;
+  color: #fff;
+  cursor: pointer;
+}
+
+.checkin-result button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.checked-in-flag {
+  font-size: 0.75rem;
+  color: #b71c1c;
+  font-weight: 600;
+}
+
+.checkin-delete-btn {
+  border: none;
+  border-radius: 4px;
+  padding: 0.3rem 0.6rem;
+  background: #d32f2f;
+  color: #fff;
+  cursor: pointer;
+}
+
+.checkin-delete-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.checkins-modal .admin-table {
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.checkins-modal {
+  width: min(700px, 90vw);
+  height: auto;
+}
+
+.member-memberships {
+  margin-top: 1rem;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  padding: 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.member-memberships h4 {
+  margin: 0;
+}
+
+.assign-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.assign-row select {
+  flex: 1;
+  border: 1px solid #cfcfcf;
+  border-radius: 4px;
+  padding: 0.4rem;
+}
+
+.assign-row button,
+.member-memberships > button {
+  border: none;
+  border-radius: 4px;
+  padding: 0.4rem 0.8rem;
+  background: #1976d2;
+  color: #fff;
+  cursor: pointer;
+}
+
+.assign-row button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.member-memberships .admin-table {
+  padding: 0.5rem;
+}
+
+.member-memberships table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.member-memberships table th,
+.member-memberships table td {
+  padding: 0.3rem 0.4rem;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.member-memberships table tr:last-child td {
+  border-bottom: none;
+}
+
+.member-memberships table td:nth-child(4) {
+  text-align: center;
+}
+
+.member-memberships table td:last-child {
+  text-align: right;
+}
+
+.member-memberships table .actions button {
+  background: #d32f2f;
+  padding: 0.25rem 0.6rem;
+}
+
+.member-memberships table td[colspan="5"] {
+  text-align: center;
+  color: #666;
+}
+
 .content-area {
   flex: 1;
   display: grid;
@@ -1806,7 +2607,7 @@
 }
 
 .bucket-row {
-  border: none;
+  border: 1px solid transparent;
   border-radius: 4px;
   padding: 0.4rem 0.45rem;
   background: #ffffff;
@@ -1818,14 +2619,47 @@
   text-align: left;
 }
 
+.bucket-row:hover {
+  border-color: #bed6ff;
+}
+
 .bucket-row.active {
   background: #bfe1ff;
+  border-color: #6fa9f7;
 }
 
 .bucket-row-main {
   display: flex;
   flex-direction: column;
   gap: 0.1rem;
+}
+
+.bucket-row-actions {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.bucket-icon {
+  border: none;
+  border-radius: 4px;
+  padding: 0.15rem 0.35rem;
+  background: #e7e7e7;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.bucket-icon:hover {
+  background: #d0d0d0;
+}
+
+.bucket-icon.danger {
+  background: #fde7e7;
+  color: #b71c1c;
+}
+
+.bucket-icon:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .bucket-name {
@@ -1835,12 +2669,6 @@
 .bucket-meta {
   font-size: 0.8rem;
   color: #4c4c4c;
-}
-
-.rename-bucket {
-  font-size: 0.8rem;
-  color: #555;
-  padding: 0.1rem 0.2rem;
 }
 
 .muted {
@@ -1955,6 +2783,75 @@
 .receipt-footer .total {
   font-size: 1.2rem;
   font-weight: 700;
+}
+
+.payment-section {
+  border-top: 1px solid #d5d5d5;
+  padding-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.payment-section label {
+  font-size: 0.85rem;
+  color: #4a4a4a;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.payment-section input {
+  border: 1px solid #cfcfcf;
+  border-radius: 4px;
+  padding: 0.4rem;
+  font: inherit;
+  background: #fff;
+}
+
+.payment-results {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.payment-results button {
+  border: 1px solid #dedede;
+  border-radius: 4px;
+  background: #ffffff;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+}
+
+.payment-results button:hover {
+  background: #f2f2f2;
+}
+
+.payment-results small {
+  font-size: 0.75rem;
+  color: #666;
+}
+
+.selected-member {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border: 1px solid #dedede;
+  border-radius: 4px;
+  padding: 0.4rem 0.5rem;
+  background: #ffffff;
+  font-size: 0.85rem;
+  gap: 0.6rem;
+}
+
+.balance-option {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
 }
 
 .checkout {

@@ -9,6 +9,7 @@ This template should help get you started developing with Tauri, SvelteKit and T
 - Persistente Einstellungen für Sprache, Währung und Datenbankpfad (`conf/settings.json`)
 - Mehrere Kassen-Buckets mit speicherbaren Tickets und Tages-Transaktionsübersicht
 - Mitglieder- und Transaktions-Ansichten direkt in der Hauptnavigation
+- Mitgliederverwaltung mit Guthaben/Mitgliedschaftstypen sowie Check-in-Protokoll inkl. Suche
 
 ## Recommended IDE Setup
 
