@@ -607,6 +607,13 @@
     return Math.round(parsed * 100);
   }
 
+  function activateOnEnterOrSpace(event: KeyboardEvent, callback: () => void) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      callback();
+    }
+  }
+
   async function handleProductClick(product: Product) {
     if (!product.id) {
       console.warn("Produkt hat keine ID und kann nicht gebucht werden.");
@@ -1374,9 +1381,11 @@
             <div
               role="button"
               tabindex="0"
+              aria-pressed={bucket.id === displayActiveBucketId}
               class="bucket-row"
               class:active={bucket.id === displayActiveBucketId}
               on:click={() => currentUser && handleBucketSelect(bucket.id)}
+              on:keydown={(event) => currentUser && activateOnEnterOrSpace(event, () => handleBucketSelect(bucket.id))}
             >
               <div class="bucket-row-main">
                 <span class="bucket-name">{bucket.name}</span>
@@ -1734,10 +1743,17 @@
 </main>
 
 {#if showAdminModal}
-  <div class="modal-overlay" on:click={closeAdminModal}>
-    <div class="modal" on:click|stopPropagation>
+  <div
+    class="modal-overlay"
+    role="button"
+    tabindex="0"
+    aria-label="Verwaltungsmenü schließen"
+    on:click={closeAdminModal}
+    on:keydown={(event) => activateOnEnterOrSpace(event, closeAdminModal)}
+  >
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="admin-modal-title" on:click|stopPropagation>
       <header class="modal-header">
-        <h2>Verwaltung</h2>
+        <h2 id="admin-modal-title">Verwaltung</h2>
         <button class="close-btn" type="button" on:click={closeAdminModal}>×</button>
       </header>
       <nav class="modal-tabs">
@@ -2216,10 +2232,23 @@
 {/if}
 
 {#if showCheckinModal}
-  <div class="modal-overlay" on:click={closeCheckinModal}>
-    <div class="modal checkins-modal" on:click|stopPropagation>
+  <div
+    class="modal-overlay"
+    role="button"
+    tabindex="0"
+    aria-label="Check-in-Übersicht schließen"
+    on:click={closeCheckinModal}
+    on:keydown={(event) => activateOnEnterOrSpace(event, closeCheckinModal)}
+  >
+    <div
+      class="modal checkins-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="checkin-modal-title"
+      on:click|stopPropagation
+    >
       <header class="modal-header">
-        <h2>Heutige Check-ins</h2>
+        <h2 id="checkin-modal-title">Heutige Check-ins</h2>
         <button class="close-btn" type="button" on:click={closeCheckinModal}>×</button>
       </header>
       <section class="modal-body">
@@ -2502,7 +2531,7 @@
 }
 
 .assign-row button,
-.member-memberships > button {
+.member-memberships .actions button {
   border: none;
   border-radius: 4px;
   padding: 0.4rem 0.8rem;
