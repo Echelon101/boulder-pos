@@ -103,3 +103,48 @@ jobs:
         with:
           name: boulderado-nsis
           path: src-tauri/target/release/bundle/nsis/*.exe
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs:
+      - linux
+      - windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Determine release metadata
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          DATE=$(date -u +%Y-%m-%d)
+          echo "APP_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "RELEASE_DATE=$DATE" >> $GITHUB_ENV
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ env.RELEASE_DATE }}
+          name: Boulderado POS v${{ env.RELEASE_DATE }}
+          body: |
+            Automated build for commit ${{ github.sha }}.
+
+            Package version: ${{ env.APP_VERSION }}
+
+            Includes Linux (DEB/RPM) and Windows (MSI/NSIS) installers.
+          artifacts: "artifacts/**/*"
+          draft: false
+          prerelease: false
+          allowUpdates: true
+          makeLatest: true
