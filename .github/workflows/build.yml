@@ -1,0 +1,105 @@
+name: Build Tauri Artifacts
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  NODE_VERSION: 20
+  RUST_TOOLCHAIN: stable
+
+jobs:
+  linux:
+    name: Linux Bundles (deb, rpm)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri bundles
+        run: npm run tauri build
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+
+      - name: Upload .deb artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boulderado-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+
+      - name: Upload .rpm artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boulderado-rpm
+          path: src-tauri/target/release/bundle/rpm/*.rpm
+
+  windows:
+    name: Windows Installers (MSI, NSIS)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install WiX and NSIS
+        run: |
+          choco install wixtoolset --no-progress -y
+          choco install nsis --no-progress -y
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri bundles
+        run: npm run tauri build
+
+      - name: Upload MSI artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boulderado-msi
+          path: src-tauri/target/release/bundle/msi/*.msi
+
+      - name: Upload NSIS artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boulderado-nsis
+          path: src-tauri/target/release/bundle/nsis/*.exe

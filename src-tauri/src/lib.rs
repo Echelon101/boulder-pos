@@ -2,7 +2,7 @@ use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, Pa
 use rand_core::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, sync::Mutex};
+use std::{collections::HashSet, fs, path::PathBuf, sync::Mutex};
 use tauri::{path::BaseDirectory, Manager, State};
 
 struct DatabasePath(PathBuf);
@@ -88,6 +88,7 @@ struct MemberRecord {
     phone: Option<String>,
     status: String,
     notes: Option<String>,
+    balance_cents: i64,
     created_at: String,
     updated_at: String,
 }
@@ -102,20 +103,18 @@ struct MemberPayload {
     phone: Option<String>,
     status: Option<String>,
     notes: Option<String>,
+    balance_cents: Option<i64>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MembershipRecord {
     id: i64,
-    member_id: i64,
-    member_name: String,
-    membership_type: String,
-    status: String,
-    start_date: Option<String>,
-    end_date: Option<String>,
+    name: String,
+    description: Option<String>,
     price_cents: Option<i64>,
-    notes: Option<String>,
+    duration_days: Option<i64>,
+    max_uses: Option<i64>,
     created_at: String,
     updated_at: String,
 }
@@ -124,13 +123,47 @@ struct MembershipRecord {
 #[serde(rename_all = "camelCase")]
 struct MembershipPayload {
     id: Option<i64>,
+    name: String,
+    description: Option<String>,
+    price_cents: Option<i64>,
+    duration_days: Option<i64>,
+    max_uses: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckinRecord {
+    id: i64,
     member_id: i64,
-    membership_type: String,
-    status: Option<String>,
+    member_name: String,
+    membership_name: Option<String>,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckinPayload {
+    member_id: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberMembershipRecord {
+    id: i64,
+    member_id: i64,
+    membership_id: i64,
+    membership_name: String,
+    remaining_uses: Option<i64>,
     start_date: Option<String>,
     end_date: Option<String>,
-    price_cents: Option<i64>,
-    notes: Option<String>,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssignMemberMembershipPayload {
+    member_id: i64,
+    membership_id: i64,
 }
 
 #[derive(Serialize)]
@@ -229,6 +262,21 @@ struct AddBucketItemPayload {
     bucket_id: i64,
     product_id: i64,
     quantity: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BucketIdPayload {
+    bucket_id: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckoutBucketPayload {
+    bucket_id: i64,
+    member_id: Option<i64>,
+    use_balance: bool,
+    payment_method: Option<String>,
 }
 
 struct DefaultProduct {
@@ -543,19 +591,10 @@ fn list_buckets(db: State<DatabasePath>) -> Result<Vec<BucketRecord>, String> {
 #[tauri::command]
 fn create_bucket(
     db: State<DatabasePath>,
-    payload: Option<CreateBucketPayload>,
+    _payload: Option<CreateBucketPayload>,
 ) -> Result<i64, String> {
     let conn = db.connect().map_err(|e| e.to_string())?;
-    let desired_name = payload.and_then(|p| p.name).map(|n| n.trim().to_string());
-    let name = if let Some(name) = desired_name {
-        if name.is_empty() {
-            generate_bucket_name(&conn).map_err(|e| e.to_string())?
-        } else {
-            name
-        }
-    } else {
-        generate_bucket_name(&conn).map_err(|e| e.to_string())?
-    };
+    let name = generate_bucket_name(&conn).map_err(|e| e.to_string())?;
     conn.execute("INSERT INTO buckets (name) VALUES (?1)", params![name])
         .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
@@ -670,6 +709,111 @@ fn add_product_to_bucket(
 }
 
 #[tauri::command]
+fn close_bucket(db: State<DatabasePath>, payload: BucketIdPayload) -> Result<(), String> {
+    let conn = db.connect().map_err(|e| e.to_string())?;
+    let updated = conn
+        .execute(
+            "UPDATE buckets SET status = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [payload.bucket_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated == 0 {
+        return Err("Bucket nicht gefunden".into());
+    }
+    conn.execute("DELETE FROM bucket_items WHERE bucket_id = ?", [payload.bucket_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_bucket(db: State<DatabasePath>, payload: BucketIdPayload) -> Result<(), String> {
+    let mut conn = db.connect().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM bucket_items WHERE bucket_id = ?", [payload.bucket_id])
+        .map_err(|e| e.to_string())?;
+    let removed = tx
+        .execute("DELETE FROM buckets WHERE id = ?", [payload.bucket_id])
+        .map_err(|e| e.to_string())?;
+    if removed == 0 {
+        return Err("Bucket nicht gefunden".into());
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn checkout_bucket(
+    db: State<DatabasePath>,
+    payload: CheckoutBucketPayload,
+) -> Result<(), String> {
+    let mut conn = db.connect().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    let bucket: Option<(String, String)> = tx
+        .query_row(
+            "SELECT name, status FROM buckets WHERE id = ?",
+            [payload.bucket_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (bucket_name, status) =
+        bucket.ok_or_else(|| "Bucket nicht gefunden".to_string())?;
+    if status.as_str() != "open" {
+        return Err("Bucket ist nicht mehr offen.".into());
+    }
+
+    let total_cents: i64 = tx
+        .query_row(
+            "SELECT COALESCE(SUM(quantity * price_cents), 0) FROM bucket_items WHERE bucket_id = ?",
+            [payload.bucket_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if total_cents <= 0 {
+        return Err("Bucket ist leer.".into());
+    }
+
+    if payload.use_balance {
+        let member_id = payload
+            .member_id
+            .ok_or_else(|| "Mitglied auswählen, um Guthaben zu verwenden.".to_string())?;
+        tx.execute(
+            "UPDATE members SET balance_cents = balance_cents - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            params![total_cents, member_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let method = if payload.use_balance {
+        "Guthaben".to_string()
+    } else {
+        payload
+            .payment_method
+            .unwrap_or_else(|| "Bar".to_string())
+    };
+
+    tx.execute(
+        "INSERT INTO transactions (product_id, quantity, total_cents, description) VALUES (NULL, 1, ?, ?)",
+        params![
+            total_cents,
+            format!("{} bezahlt ({})", bucket_name, method)
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.execute("DELETE FROM bucket_items WHERE bucket_id = ?", [payload.bucket_id])
+        .map_err(|e| e.to_string())?;
+
+    tx.execute(
+        "UPDATE buckets SET status = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [payload.bucket_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn list_product_types(db: State<DatabasePath>) -> Result<Vec<ProductTypeRecord>, String> {
     let conn = db.connect().map_err(|e| e.to_string())?;
     let mut stmt = conn
@@ -732,9 +876,18 @@ fn list_members(db: State<DatabasePath>) -> Result<Vec<MemberRecord>, String> {
     let mut stmt = conn
         .prepare(
             "
-        SELECT id, first_name, last_name, email, phone, status, notes, created_at, updated_at
-        FROM members
-        ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+        SELECT m.id,
+               m.first_name,
+               m.last_name,
+               m.email,
+               m.phone,
+               m.status,
+               m.notes,
+               m.balance_cents,
+               m.created_at,
+               m.updated_at
+        FROM members m
+        ORDER BY m.last_name COLLATE NOCASE, m.first_name COLLATE NOCASE
         ",
         )
         .map_err(|e| e.to_string())?;
@@ -749,8 +902,9 @@ fn list_members(db: State<DatabasePath>) -> Result<Vec<MemberRecord>, String> {
                 phone: row.get(4)?,
                 status: row.get(5)?,
                 notes: row.get(6)?,
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
+                balance_cents: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -765,7 +919,14 @@ fn save_member(db: State<DatabasePath>, payload: MemberPayload) -> Result<i64, S
     if let Some(id) = payload.id {
         conn.execute(
             "UPDATE members
-            SET first_name = ?, last_name = ?, email = ?, phone = ?, status = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+            SET first_name = ?,
+                last_name = ?,
+                email = ?,
+                phone = ?,
+                status = ?,
+                notes = ?,
+                balance_cents = ?,
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = ?",
             params![
                 payload.first_name,
@@ -774,6 +935,7 @@ fn save_member(db: State<DatabasePath>, payload: MemberPayload) -> Result<i64, S
                 payload.phone,
                 payload.status.unwrap_or_else(|| "active".into()),
                 payload.notes,
+                payload.balance_cents.unwrap_or(0),
                 id
             ],
         )
@@ -781,15 +943,16 @@ fn save_member(db: State<DatabasePath>, payload: MemberPayload) -> Result<i64, S
         Ok(id)
     } else {
         conn.execute(
-            "INSERT INTO members (first_name, last_name, email, phone, status, notes)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO members (first_name, last_name, email, phone, status, notes, balance_cents)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 payload.first_name,
                 payload.last_name,
                 payload.email,
                 payload.phone,
                 payload.status.unwrap_or_else(|| "active".into()),
-                payload.notes
+                payload.notes,
+                payload.balance_cents.unwrap_or(0)
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -811,20 +974,16 @@ fn list_memberships(db: State<DatabasePath>) -> Result<Vec<MembershipRecord>, St
     let mut stmt = conn
         .prepare(
             "
-        SELECT ms.id,
-               ms.member_id,
-               m.first_name || ' ' || m.last_name AS member_name,
-               ms.membership_type,
-               ms.status,
-               ms.start_date,
-               ms.end_date,
-               ms.price_cents,
-               ms.notes,
-               ms.created_at,
-               ms.updated_at
-        FROM memberships ms
-        LEFT JOIN members m ON m.id = ms.member_id
-        ORDER BY ms.created_at DESC
+        SELECT id,
+               membership_type,
+               notes,
+               price_cents,
+               duration_days,
+               max_uses,
+               created_at,
+               updated_at
+        FROM memberships
+        ORDER BY created_at DESC
         ",
         )
         .map_err(|e| e.to_string())?;
@@ -833,16 +992,13 @@ fn list_memberships(db: State<DatabasePath>) -> Result<Vec<MembershipRecord>, St
         .query_map([], |row| {
             Ok(MembershipRecord {
                 id: row.get(0)?,
-                member_id: row.get(1)?,
-                member_name: row.get(2).unwrap_or_else(|_| "Unbekannt".into()),
-                membership_type: row.get(3)?,
-                status: row.get(4)?,
-                start_date: row.get(5)?,
-                end_date: row.get(6)?,
-                price_cents: row.get(7)?,
-                notes: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                price_cents: row.get(3)?,
+                duration_days: row.get(4)?,
+                max_uses: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -857,16 +1013,14 @@ fn save_membership(db: State<DatabasePath>, payload: MembershipPayload) -> Resul
     if let Some(id) = payload.id {
         conn.execute(
             "UPDATE memberships
-            SET member_id = ?, membership_type = ?, status = ?, start_date = ?, end_date = ?, price_cents = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+            SET membership_type = ?, notes = ?, price_cents = ?, duration_days = ?, max_uses = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?",
             params![
-                payload.member_id,
-                payload.membership_type,
-                payload.status.unwrap_or_else(|| "active".into()),
-                payload.start_date,
-                payload.end_date,
+                payload.name,
+                payload.description,
                 payload.price_cents,
-                payload.notes,
+                payload.duration_days,
+                payload.max_uses,
                 id
             ],
         )
@@ -874,16 +1028,14 @@ fn save_membership(db: State<DatabasePath>, payload: MembershipPayload) -> Resul
         Ok(id)
     } else {
         conn.execute(
-            "INSERT INTO memberships (member_id, membership_type, status, start_date, end_date, price_cents, notes)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO memberships (membership_type, notes, price_cents, duration_days, max_uses)
+            VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                payload.member_id,
-                payload.membership_type,
-                payload.status.unwrap_or_else(|| "active".into()),
-                payload.start_date,
-                payload.end_date,
+                payload.name,
+                payload.description,
                 payload.price_cents,
-                payload.notes
+                payload.duration_days,
+                payload.max_uses
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -900,11 +1052,220 @@ fn delete_membership(db: State<DatabasePath>, id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn list_member_memberships(db: State<DatabasePath>) -> Result<Vec<MemberMembershipRecord>, String> {
+    let conn = db.connect().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "
+        SELECT mm.id,
+               mm.member_id,
+               mm.membership_id,
+               ms.membership_type,
+               mm.remaining_uses,
+               mm.start_date,
+               mm.end_date,
+               mm.created_at
+        FROM member_memberships mm
+        JOIN memberships ms ON ms.id = mm.membership_id
+        ORDER BY mm.member_id, mm.created_at DESC
+        ",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(MemberMembershipRecord {
+                id: row.get(0)?,
+                member_id: row.get(1)?,
+                membership_id: row.get(2)?,
+                membership_name: row.get(3)?,
+                remaining_uses: row.get(4)?,
+                start_date: row.get(5)?,
+                end_date: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn assign_member_membership(
+    db: State<DatabasePath>,
+    payload: AssignMemberMembershipPayload,
+) -> Result<i64, String> {
+    let conn = db.connect().map_err(|e| e.to_string())?;
+    let membership: (String, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT membership_type, duration_days, max_uses FROM memberships WHERE id = ?",
+            [payload.membership_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| "Mitgliedschaft nicht gefunden".to_string())?;
+
+    let duration_days = membership.1;
+    let max_uses = membership.2;
+    let end_interval = duration_days.map(|days| format!("+{} days", days));
+
+    conn.execute(
+        "INSERT INTO member_memberships (member_id, membership_id, remaining_uses, start_date, end_date)
+        VALUES (?1, ?2, ?3, DATE('now','localtime'), CASE WHEN ?4 IS NOT NULL THEN DATE('now','localtime', ?4) ELSE NULL END)",
+        params![payload.member_id, payload.membership_id, max_uses, end_interval],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+#[tauri::command]
+fn delete_member_membership(db: State<DatabasePath>, id: i64) -> Result<(), String> {
+    let conn = db.connect().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM member_memberships WHERE id = ?", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn delete_transaction(db: State<DatabasePath>, id: i64) -> Result<(), String> {
     let conn = db.connect().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM transactions WHERE id = ?", [id])
         .map_err(|e| e.to_string())
         .map(|_| ())
+}
+
+#[tauri::command]
+fn record_checkin(db: State<DatabasePath>, payload: CheckinPayload) -> Result<(), String> {
+    let conn = db.connect().map_err(|e| e.to_string())?;
+    let existing = conn
+        .query_row(
+            "SELECT 1 FROM member_checkins WHERE member_id = ? AND DATE(created_at, 'localtime') = DATE('now', 'localtime')",
+            [payload.member_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if existing.is_some() {
+        return Err("Mitglied ist heute bereits eingecheckt".into());
+    }
+
+    let candidate = conn
+        .query_row(
+            "SELECT mm.id, mm.membership_id, mm.remaining_uses
+            FROM member_memberships mm
+            JOIN memberships ms ON ms.id = mm.membership_id
+            WHERE mm.member_id = ?
+              AND (mm.remaining_uses IS NULL OR mm.remaining_uses > 0)
+              AND (mm.end_date IS NULL OR DATE(mm.end_date) >= DATE('now','localtime'))
+            ORDER BY (mm.end_date IS NULL) ASC, mm.end_date ASC, mm.created_at ASC
+            LIMIT 1",
+            [payload.member_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let (member_membership_id, membership_id, remaining_uses) = candidate
+        .ok_or_else(|| "Keine aktive Mitgliedschaft gefunden".to_string())?;
+
+    conn.execute(
+        "INSERT INTO member_checkins (member_id, membership_id, member_membership_id) VALUES (?1, ?2, ?3)",
+        params![payload.member_id, membership_id, member_membership_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    if let Some(uses) = remaining_uses {
+        let new_uses = uses.saturating_sub(1);
+        conn.execute(
+            "UPDATE member_memberships SET remaining_uses = ? WHERE id = ?",
+            params![new_uses, member_membership_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_checkin(db: State<DatabasePath>, id: i64) -> Result<(), String> {
+    let mut conn = db.connect().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let details = tx
+        .query_row(
+            "SELECT member_membership_id, membership_id FROM member_checkins WHERE id = ?",
+            [id],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let (member_membership_id, _membership_id) =
+        details.ok_or_else(|| "Check-in nicht gefunden".to_string())?;
+
+    if let Some(mm_id) = member_membership_id {
+        if let Some((remaining_uses, max_uses)) = tx
+            .query_row(
+                "SELECT remaining_uses, ms.max_uses
+                FROM member_memberships mm
+                JOIN memberships ms ON ms.id = mm.membership_id
+                WHERE mm.id = ?",
+                [mm_id],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+        {
+            if let Some(current) = remaining_uses {
+                let cap = max_uses.unwrap_or(i64::MAX);
+                let new_value = (current + 1).min(cap);
+                tx.execute(
+                    "UPDATE member_memberships SET remaining_uses = ? WHERE id = ?",
+                    params![new_value, mm_id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    tx.execute("DELETE FROM member_checkins WHERE id = ?", [id])
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_checkins_today(db: State<DatabasePath>) -> Result<Vec<CheckinRecord>, String> {
+    let conn = db.connect().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "
+        SELECT c.id,
+               c.member_id,
+               m.first_name || ' ' || m.last_name AS member_name,
+               ms.membership_type,
+               c.created_at
+        FROM member_checkins c
+        JOIN members m ON m.id = c.member_id
+        LEFT JOIN memberships ms ON ms.id = c.membership_id
+        WHERE DATE(c.created_at, 'localtime') = DATE('now', 'localtime')
+        ORDER BY c.created_at DESC
+        ",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(CheckinRecord {
+                id: row.get(0)?,
+                member_id: row.get(1)?,
+                member_name: row.get(2)?,
+                membership_name: row.get(3).ok(),
+                created_at: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1155,21 +1516,30 @@ fn initialize_db(conn: &Connection) -> rusqlite::Result<()> {
             phone TEXT,
             status TEXT NOT NULL DEFAULT 'active',
             notes TEXT,
+            balance_cents INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS memberships (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            member_id INTEGER NOT NULL,
             membership_type TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active',
-            start_date TEXT,
-            end_date TEXT,
             price_cents INTEGER,
             notes TEXT,
+            duration_days INTEGER,
+            max_uses INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(member_id) REFERENCES members(id) ON DELETE CASCADE
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS member_memberships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_id INTEGER NOT NULL,
+            membership_id INTEGER NOT NULL,
+            remaining_uses INTEGER,
+            start_date TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            end_date TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(member_id) REFERENCES members(id) ON DELETE CASCADE,
+            FOREIGN KEY(membership_id) REFERENCES memberships(id)
         );
         CREATE TABLE IF NOT EXISTS buckets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1189,6 +1559,16 @@ fn initialize_db(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(bucket_id) REFERENCES buckets(id) ON DELETE CASCADE,
             FOREIGN KEY(product_id) REFERENCES products(id),
             UNIQUE(bucket_id, product_id)
+        );
+        CREATE TABLE IF NOT EXISTS member_checkins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_id INTEGER NOT NULL,
+            membership_id INTEGER,
+            member_membership_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(member_id) REFERENCES members(id) ON DELETE CASCADE,
+            FOREIGN KEY(membership_id) REFERENCES memberships(id),
+            FOREIGN KEY(member_membership_id) REFERENCES member_memberships(id) ON DELETE SET NULL
         );
         CREATE INDEX IF NOT EXISTS idx_bucket_items_bucket ON bucket_items(bucket_id);
         ",
@@ -1221,6 +1601,72 @@ fn load_settings_from_disk(path: &PathBuf, default: AppSettings) -> AppSettings 
         Ok(content) => serde_json::from_str(&content).unwrap_or(default),
         Err(_) => default,
     }
+}
+
+fn ensure_member_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(members)")?;
+    let mut has_balance = false;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "balance_cents" {
+            has_balance = true;
+        }
+    }
+
+    if !has_balance {
+        conn.execute(
+            "ALTER TABLE members ADD COLUMN balance_cents INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_membership_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memberships)")?;
+    let mut has_duration = false;
+    let mut has_max = false;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "duration_days" {
+            has_duration = true;
+        } else if name == "max_uses" {
+            has_max = true;
+        }
+    }
+
+    if !has_duration {
+        conn.execute(
+            "ALTER TABLE memberships ADD COLUMN duration_days INTEGER",
+            [],
+        )?;
+    }
+    if !has_max {
+        conn.execute("ALTER TABLE memberships ADD COLUMN max_uses INTEGER", [])?;
+    }
+    Ok(())
+}
+
+fn ensure_checkin_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(member_checkins)")?;
+    let mut has_member_membership_id = false;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "member_membership_id" {
+            has_member_membership_id = true;
+        }
+    }
+
+    if !has_member_membership_id {
+        conn.execute(
+            "ALTER TABLE member_checkins ADD COLUMN member_membership_id INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn hash_password(password: &str) -> Result<String, String> {
@@ -1300,8 +1746,30 @@ fn ensure_default_bucket(conn: &mut Connection) -> rusqlite::Result<()> {
 }
 
 fn generate_bucket_name(conn: &Connection) -> rusqlite::Result<String> {
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM buckets", [], |row| row.get(0))?;
-    Ok(format!("Bucket {}", count + 1))
+    let mut stmt = conn.prepare("SELECT name FROM buckets WHERE status = 'open'")?;
+    let mut used_numbers: HashSet<i64> = HashSet::new();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        if let Some(number) = extract_bucket_number(&name) {
+            used_numbers.insert(number);
+        }
+    }
+
+    let mut candidate = 1;
+    while used_numbers.contains(&candidate) {
+        candidate += 1;
+    }
+    Ok(format!("Bucket {}", candidate))
+}
+
+fn extract_bucket_number(name: &str) -> Option<i64> {
+    let digits: String = name.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 fn ensure_roles(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -1353,6 +1821,9 @@ pub fn run() {
             let mut conn = Connection::open(&db_path)?;
             initialize_db(&conn)?;
             ensure_product_type_column(&conn)?;
+            ensure_member_columns(&conn)?;
+            ensure_membership_columns(&conn)?;
+            ensure_checkin_columns(&conn)?;
             ensure_roles(&mut conn)?;
             ensure_admin_user(&conn)?;
             seed_default_product_types(&conn)?;
@@ -1387,12 +1858,18 @@ pub fn run() {
             record_transaction,
             list_transactions,
             delete_transaction,
+            record_checkin,
+            delete_checkin,
+            list_checkins_today,
             list_transactions_today,
             list_buckets,
             create_bucket,
             rename_bucket,
             get_bucket_items,
             add_product_to_bucket,
+            close_bucket,
+            delete_bucket,
+            checkout_bucket,
             list_product_types,
             save_product_type,
             delete_product_type,
@@ -1402,6 +1879,9 @@ pub fn run() {
             list_memberships,
             save_membership,
             delete_membership,
+            list_member_memberships,
+            assign_member_membership,
+            delete_member_membership,
             list_users,
             save_user,
             delete_user,
